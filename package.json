@@ -2,5 +2,5 @@
   "name": "billdecoded",
   "version": "1.0.0",
   "description": "AI-powered bill explainer — understand any bill instantly",
-  "engines": { "node": "18.x" }
+  "engines": { "node": "20.x" }
 }
