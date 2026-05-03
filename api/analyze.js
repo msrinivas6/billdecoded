@@ -19,104 +19,142 @@ export default async function handler(req, res) {
     insurance:'insurance', other:'general'
   };
 
-  const jsonTemplate = `{"billType":"exact bill name","totalAmount":"exact $ from bill","summary":"2 sentences about this specific bill","overallVerdict":"ok or warn or danger","verdictText":"one honest sentence","potentialSavings":"$X or null","flags":[{"name":"charge","amount":"$X","type":"warn","badge":"Suspicious","explanation":"why flagged and what to do"}],"lineItems":[{"icon":"emoji","name":"charge","amount":"$X","explanation":"plain English meaning"}],"questionsToAsk":["question 1","question 2","question 3"]}`;
+  const jsonTemplate = `{"billType":"exact bill name","totalAmount":"exact $ total from bill","summary":"2 sentences about this specific bill","overallVerdict":"ok or warn or danger","verdictText":"one honest sentence","potentialSavings":"$X or null","flags":[{"name":"charge name","amount":"$X","type":"warn","badge":"Suspicious","explanation":"why flagged"}],"lineItems":[{"icon":"emoji","name":"charge","amount":"$X","explanation":"plain English meaning"}],"questionsToAsk":["question 1","question 2","question 3"]}`;
 
-  const prompt = `You are a consumer billing expert specializing in ${typeMap[billType]||'general'} bills.
-Analyze this bill carefully and return ONLY valid JSON. No markdown. No extra text.
-Use EXACT amounts and names from the bill — do not make up numbers.
-
-Required JSON: ${jsonTemplate}
-
-Rules:
-- totalAmount: use the EXACT total shown on the bill
-- flags: only suspicious/unusual items, max 5, use [] if everything looks normal  
-- lineItems: explain ALL charges shown, max 12
-- questionsToAsk: 3-5 specific actionable questions
-- Return ONLY the JSON object`;
+  const analysisInstruction = `You are a billing expert. Analyze this ${typeMap[billType]||'general'} bill.
+Return ONLY valid JSON. No markdown. No extra text. Use EXACT amounts from the bill.
+Required JSON structure: ${jsonTemplate}
+Rules: totalAmount=exact total shown. flags=suspicious items only max 5, []=if normal. lineItems=ALL charges max 12. questionsToAsk=3-5 questions. Return ONLY JSON.`;
 
   try {
-    // Choose model based on whether image is provided
-    const hasImage = !!imageBase64;
-    const model = hasImage
-      ? 'meta-llama/llama-4-scout-17b-16e-instruct'  // vision model for images
-      : 'llama-3.3-70b-versatile';                    // text model for paste
+    // PATH 1: Image — use Groq vision
+    if (imageBase64) {
+      // Ensure mime type is supported (jpg or png only for Groq vision)
+      const supportedMime = (imageMime && imageMime.includes('png')) ? 'image/png' : 'image/jpeg';
+      const imageUrl = `data:${supportedMime};base64,${imageBase64}`;
+      
+      console.log('Image path - mime:', supportedMime, '- base64 length:', imageBase64.length);
 
-    console.log('Model:', model, '| Has image:', hasImage, '| Has text:', !!text);
-
-    // Build message content
-    let messageContent;
-    if (hasImage) {
-      const mime = imageMime || 'image/jpeg';
-      messageContent = [
-        {
-          type: 'image_url',
-          image_url: { url: `data:${mime};base64,${imageBase64}` }
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${groqKey}`
         },
-        {
-          type: 'text',
-          text: prompt + '\n\nRead ALL text, numbers and amounts from this bill image and analyze it.'
-        }
-      ];
-    } else {
-      messageContent = prompt + '\n\nBill to analyze:\n' + text;
+        body: JSON.stringify({
+          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text: analysisInstruction + '\n\nRead ALL text, charges and amounts visible in this bill image, then return the JSON analysis.'
+                },
+                {
+                  type: 'image_url',
+                  image_url: {
+                    url: imageUrl,
+                    detail: 'high'
+                  }
+                }
+              ]
+            }
+          ],
+          temperature: 0.1,
+          max_tokens: 2000
+        })
+      });
+
+      const data = await response.json();
+      console.log('Groq vision status:', response.status);
+
+      if (response.status === 429) {
+        return res.status(429).json({ error: 'Too busy right now. Please wait 1 minute and try again.' });
+      }
+
+      if (!response.ok) {
+        console.error('Groq vision error:', JSON.stringify(data.error));
+        // If vision fails, ask user to paste text
+        return res.status(500).json({ 
+          error: 'Could not read this image. Please paste the bill text in the text box instead — it works perfectly!' 
+        });
+      }
+
+      const rawText = data.choices?.[0]?.message?.content || '';
+      console.log('Vision response length:', rawText.length);
+      const result = parseJSON(rawText);
+      if (result) {
+        console.log('SUCCESS via vision! Total:', result.totalAmount);
+        return res.status(200).json(result);
+      }
+      return res.status(500).json({ error: 'Could not parse image analysis. Please paste the bill text instead.' });
     }
 
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${groqKey}`
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a billing expert. Always respond with ONLY valid JSON. No markdown, no extra text, no explanation.'
-          },
-          {
-            role: 'user',
-            content: messageContent
-          }
-        ],
-        temperature: 0.1,
-        max_tokens: 2000
-      })
-    });
+    // PATH 2: Text — use Groq text model
+    if (text) {
+      console.log('Text path - length:', text.length);
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${groqKey}`
+        },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a billing expert. Always respond with ONLY valid JSON. No markdown, no extra text.'
+            },
+            {
+              role: 'user',
+              content: analysisInstruction + '\n\nBill text to analyze:\n' + text
+            }
+          ],
+          temperature: 0.1,
+          max_tokens: 2000
+        })
+      });
 
-    const data = await response.json();
-    console.log('Status:', response.status);
+      const data = await response.json();
+      console.log('Groq text status:', response.status);
 
-    if (response.status === 429) {
-      return res.status(429).json({ error: 'Too many requests. Please wait 1 minute and try again.' });
-    }
+      if (response.status === 429) {
+        return res.status(429).json({ error: 'Too busy right now. Please wait 1 minute and try again.' });
+      }
 
-    if (!response.ok) {
-      console.error('Groq error:', data.error?.message);
-      return res.status(500).json({ error: data.error?.message || 'AI service error' });
-    }
+      if (!response.ok) {
+        console.error('Groq text error:', data.error?.message);
+        return res.status(500).json({ error: data.error?.message || 'AI service error' });
+      }
 
-    const rawText = data.choices?.[0]?.message?.content || '';
-    console.log('Response length:', rawText.length);
-    console.log('Preview:', rawText.substring(0, 100));
-
-    if (!rawText) return res.status(500).json({ error: 'Empty response from AI' });
-
-    // Parse JSON
-    const clean = rawText.replace(/```json\s*/gi,'').replace(/```\s*/gi,'').trim();
-    const start = clean.indexOf('{');
-    const end = clean.lastIndexOf('}');
-    if (start === -1 || end === -1) {
-      console.error('No JSON found in:', clean.substring(0, 200));
+      const rawText = data.choices?.[0]?.message?.content || '';
+      console.log('Text response length:', rawText.length);
+      const result = parseJSON(rawText);
+      if (result) {
+        console.log('SUCCESS via text! Total:', result.totalAmount);
+        return res.status(200).json(result);
+      }
       return res.status(500).json({ error: 'Could not parse response. Please try again.' });
     }
 
-    const result = JSON.parse(clean.substring(start, end+1));
-    console.log('SUCCESS — Bill type:', result.billType, '| Total:', result.totalAmount);
-    return res.status(200).json(result);
-
   } catch (err) {
-    console.error('Error:', err.message);
+    console.error('Caught error:', err.message);
     return res.status(500).json({ error: err.message });
+  }
+}
+
+function parseJSON(text) {
+  if (!text) return null;
+  try {
+    const clean = text.replace(/```json\s*/gi,'').replace(/```\s*/gi,'').trim();
+    const start = clean.indexOf('{');
+    const end = clean.lastIndexOf('}');
+    if (start === -1 || end === -1) return null;
+    return JSON.parse(clean.substring(start, end+1));
+  } catch (e) {
+    console.error('JSON parse error:', e.message);
+    return null;
   }
 }
