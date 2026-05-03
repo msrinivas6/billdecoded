@@ -81,7 +81,7 @@ ${text ? `\nBill text to analyze:\n${text}` : '\nAnalyze the bill shown in the i
   parts.push({ text: prompt });
 
   // Try gemini-1.5-flash first, fallback to gemini-pro
-  const models = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro'];
+  const models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
   let lastError = null;
 
   for (const model of models) {
