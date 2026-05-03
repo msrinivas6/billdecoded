@@ -9,132 +9,89 @@ export default async function handler(req, res) {
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    res.status(500).json({ error: 'API key not configured. Add GEMINI_API_KEY in Vercel environment variables.' });
-    return;
+    return res.status(500).json({ error: 'GEMINI_API_KEY not set in Vercel environment variables' });
   }
 
-  const { billType, text, imageBase64, imageMime } = req.body;
+  const { billType, text, imageBase64, imageMime } = req.body || {};
+
   if (!text && !imageBase64) {
-    res.status(400).json({ error: 'Please provide bill text or an image.' });
-    return;
+    return res.status(400).json({ error: 'No bill text or image provided' });
   }
 
   const typeMap = {
-    hospital: 'hospital/medical', utility: 'utility (electricity, gas, water)',
-    phone: 'phone/mobile/internet', contractor: 'contractor/home service/repair',
+    hospital: 'hospital/medical', utility: 'utility',
+    phone: 'phone/mobile', contractor: 'contractor',
     insurance: 'insurance', other: 'general'
   };
-  const tLabel = typeMap[billType] || 'general';
 
-  const prompt = `You are a consumer advocate and billing expert specializing in ${tLabel} bills.
-Analyze this bill and return ONLY a valid JSON object. No markdown, no extra text outside JSON.
+  const prompt = `You are a billing expert. Analyze this ${typeMap[billType] || 'general'} bill and return ONLY valid JSON.
 
-Return exactly this JSON structure:
-{
-  "billType": "descriptive name e.g. Hospital Emergency Visit Bill",
-  "totalAmount": "$X,XXX.XX",
-  "summary": "2 sentences in plain English explaining what this bill is for",
-  "overallVerdict": "ok OR warn OR danger",
-  "verdictText": "one honest sentence about this bill",
-  "potentialSavings": "$XXX or null",
-  "flags": [
-    {
-      "name": "charge name",
-      "amount": "$XX",
-      "type": "warn or danger or ok or info",
-      "badge": "Suspicious or Dispute This or Overcharged or Verify This or Unknown Charge",
-      "explanation": "plain English explanation of why this is flagged"
-    }
-  ],
-  "lineItems": [
-    {
-      "icon": "single emoji",
-      "name": "charge name",
-      "amount": "$XX",
-      "explanation": "what this charge means in simple plain English"
-    }
-  ],
-  "questionsToAsk": [
-    "specific question to ask the biller"
-  ]
-}
+Return this exact structure (no markdown, no extra text):
+{"billType":"Hospital Bill","totalAmount":"$925","summary":"This is a hospital emergency visit bill with 4 charges.","overallVerdict":"warn","verdictText":"Two charges look unusual and are worth questioning.","potentialSavings":"$200","flags":[{"name":"Facility Fee","amount":"$200","type":"warn","badge":"Verify This","explanation":"This fee is often negotiable. Ask if it can be waived."}],"lineItems":[{"icon":"🏥","name":"Emergency Room Visit","amount":"$450","explanation":"The base charge for using the emergency room."}],"questionsToAsk":["Can you waive the facility fee?","Do you offer a payment plan?"]}
 
-Rules:
-- flags: only suspicious or unusual items, max 5, use empty array [] if everything looks normal
-- lineItems: explain ALL charges from the bill, max 12 items
-- questionsToAsk: 3 to 5 specific actionable questions
-- overallVerdict must be exactly: ok, warn, or danger
-- Be direct and honest
-- Return ONLY the JSON, nothing else
-${text ? `\nBill text to analyze:\n${text}` : '\nAnalyze the bill shown in the image.'}`;
+Bill to analyze:
+${text || 'See image provided'}`;
 
-  // Build request parts for Gemini
   const parts = [];
-
   if (imageBase64) {
-    const mime = (imageMime && imageMime !== 'application/pdf') ? imageMime : 'image/jpeg';
-    parts.push({
-      inline_data: { mime_type: mime, data: imageBase64 }
-    });
+    parts.push({ inline_data: { mime_type: imageMime || 'image/jpeg', data: imageBase64 } });
   }
-
   parts.push({ text: prompt });
 
-  // Try gemini-1.5-flash first, fallback to gemini-pro
-  const models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.5-flash'];
-  let lastError = null;
+  const model = 'gemini-2.0-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-  for (const model of models) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      
-      console.log(`Trying model: ${model}`);
-      
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 2500 }
-        })
+  try {
+    console.log('Calling Gemini model:', model);
+    console.log('Has image:', !!imageBase64);
+    console.log('Has text:', !!text);
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 2000 }
+      })
+    });
+
+    const data = await response.json();
+    console.log('Gemini HTTP status:', response.status);
+    console.log('Gemini response keys:', Object.keys(data));
+
+    if (!response.ok) {
+      console.error('Gemini error:', JSON.stringify(data));
+      return res.status(500).json({ 
+        error: data.error?.message || 'Gemini API error: ' + response.status,
+        details: data.error
       });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        const errMsg = data.error?.message || `HTTP ${response.status}`;
-        console.error(`Model ${model} error:`, errMsg);
-        lastError = errMsg;
-        continue; // try next model
-      }
-
-      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      if (!rawText) {
-        lastError = 'Empty response from AI';
-        continue;
-      }
-
-      // Parse JSON from response
-      let txt = rawText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
-      const start = txt.indexOf('{');
-      const end = txt.lastIndexOf('}');
-      if (start === -1 || end === -1) {
-        lastError = 'Could not find JSON in response';
-        continue;
-      }
-
-      const result = JSON.parse(txt.substring(start, end + 1));
-      console.log(`Success with model: ${model}`);
-      return res.status(200).json(result);
-
-    } catch (err) {
-      console.error(`Model ${model} threw:`, err.message);
-      lastError = err.message;
-      continue;
     }
-  }
 
-  // All models failed
-  console.error('All models failed. Last error:', lastError);
-  res.status(500).json({ error: lastError || 'AI analysis failed. Please try again.' });
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    console.log('Raw text length:', rawText?.length);
+    console.log('Raw text preview:', rawText?.substring(0, 200));
+
+    if (!rawText) {
+      console.error('No text in response:', JSON.stringify(data));
+      return res.status(500).json({ error: 'Gemini returned empty response', raw: data });
+    }
+
+    const clean = rawText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+    const start = clean.indexOf('{');
+    const end = clean.lastIndexOf('}');
+
+    if (start === -1 || end === -1) {
+      console.error('No JSON found in:', clean);
+      return res.status(500).json({ error: 'Could not find JSON in response', raw: clean });
+    }
+
+    const result = JSON.parse(clean.substring(start, end + 1));
+    console.log('Success! Bill type:', result.billType);
+    return res.status(200).json(result);
+
+  } catch (err) {
+    console.error('Caught error:', err.message);
+    console.error('Stack:', err.stack);
+    return res.status(500).json({ error: err.message });
+  }
 }
