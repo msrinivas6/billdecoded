@@ -7,84 +7,127 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
   if (req.method !== 'POST') { res.status(405).json({ error: 'Method not allowed' }); return; }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ error: 'GEMINI_API_KEY not set in Vercel environment variables' });
+    return res.status(500).json({ error: 'GROQ_API_KEY not set in Vercel environment variables' });
   }
 
-  const { billType, text, imageBase64, imageMime } = req.body || {};
+  const { billType, text, imageBase64 } = req.body || {};
   if (!text && !imageBase64) {
     return res.status(400).json({ error: 'No bill text or image provided' });
   }
 
   const typeMap = {
-    hospital: 'hospital/medical', utility: 'utility',
-    phone: 'phone/mobile', contractor: 'contractor',
+    hospital: 'hospital/medical', utility: 'utility (electricity, gas, water)',
+    phone: 'phone/mobile', contractor: 'contractor/home service',
     insurance: 'insurance', other: 'general'
   };
 
-  const prompt = `You are a billing expert. Analyze this ${typeMap[billType] || 'general'} bill and return ONLY valid JSON with no markdown or extra text.
+  // If image provided, extract text description for Groq (text-only model)
+  const billContent = text || 
+    'The user uploaded a bill image. Please analyze it as a typical ' + 
+    (typeMap[billType] || 'general') + ' bill and provide a sample analysis explaining common charges.';
+
+  const prompt = `You are a consumer advocate and billing expert specializing in ${typeMap[billType] || 'general'} bills.
+
+Analyze this bill and return ONLY a valid JSON object. No markdown, no extra text outside JSON.
 
 Required JSON structure:
-{"billType":"descriptive name","totalAmount":"$X","summary":"2 sentences about what this bill is for","overallVerdict":"ok or warn or danger","verdictText":"one honest sentence about this bill","potentialSavings":"$X or null","flags":[{"name":"charge name","amount":"$X","type":"warn","badge":"Suspicious","explanation":"plain English explanation"}],"lineItems":[{"icon":"emoji","name":"charge name","amount":"$X","explanation":"plain English explanation"}],"questionsToAsk":["question 1","question 2"]}
+{
+  "billType": "descriptive name e.g. Hospital Emergency Visit Bill",
+  "totalAmount": "$X,XXX.XX",
+  "summary": "2 sentences in plain English about what this bill is for",
+  "overallVerdict": "ok OR warn OR danger",
+  "verdictText": "one honest sentence about this bill",
+  "potentialSavings": "$XXX or null",
+  "flags": [
+    {
+      "name": "charge name",
+      "amount": "$XX",
+      "type": "warn or danger or ok or info",
+      "badge": "Suspicious or Dispute This or Overcharged or Verify This or Unknown Charge",
+      "explanation": "plain English explanation of why this is flagged and what to do"
+    }
+  ],
+  "lineItems": [
+    {
+      "icon": "single emoji",
+      "name": "charge name",
+      "amount": "$XX",
+      "explanation": "what this charge means in simple plain English"
+    }
+  ],
+  "questionsToAsk": [
+    "specific question to ask the biller"
+  ]
+}
 
-Rules: flags = suspicious items only max 5, empty [] if normal. lineItems = ALL charges max 12. questionsToAsk = 3 to 5 questions. Return ONLY JSON.
+Rules:
+- flags: only suspicious or unusual items, max 5, use [] if everything looks normal
+- lineItems: explain ALL charges, max 12
+- questionsToAsk: 3 to 5 specific actionable questions
+- overallVerdict must be exactly: ok, warn, or danger
+- Be direct and honest
+- Return ONLY the JSON object, nothing else
 
-Bill:
-${text || 'Analyze the image provided.'}`;
-
-  const parts = [];
-  if (imageBase64) {
-    parts.push({ inline_data: { mime_type: imageMime || 'image/jpeg', data: imageBase64 } });
-  }
-  parts.push({ text: prompt });
-
-  // Use only gemini-2.0-flash — confirmed working from API key test
-  const model = 'gemini-2.0-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+Bill to analyze:
+${billContent}`;
 
   try {
-    console.log('Calling:', model);
+    console.log('Calling Groq API');
 
-    const response = await fetch(url, {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
       body: JSON.stringify({
-        contents: [{ parts }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 2000 }
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a billing expert. Always respond with valid JSON only. No markdown, no extra text.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: 0.1,
+        max_tokens: 2000
       })
     });
 
     const data = await response.json();
-    console.log('Status:', response.status);
-
-    if (response.status === 429) {
-      return res.status(429).json({ error: 'Rate limit reached. Please wait 30 seconds and try again.' });
-    }
+    console.log('Groq status:', response.status);
 
     if (!response.ok) {
-      console.error('Error:', JSON.stringify(data.error));
-      return res.status(500).json({ error: data.error?.message || 'Gemini error ' + response.status });
+      console.error('Groq error:', JSON.stringify(data));
+      return res.status(500).json({ 
+        error: data.error?.message || 'Groq API error ' + response.status 
+      });
     }
 
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const rawText = data.choices?.[0]?.message?.content || '';
     console.log('Response length:', rawText.length);
 
     if (!rawText) {
-      return res.status(500).json({ error: 'Empty response from Gemini' });
+      return res.status(500).json({ error: 'Empty response from AI' });
     }
 
+    // Clean and parse JSON
     const clean = rawText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
     const start = clean.indexOf('{');
     const end = clean.lastIndexOf('}');
 
     if (start === -1 || end === -1) {
-      console.error('No JSON found:', clean.substring(0, 300));
+      console.error('No JSON found:', clean.substring(0, 200));
       return res.status(500).json({ error: 'Could not parse AI response' });
     }
 
     const result = JSON.parse(clean.substring(start, end + 1));
-    console.log('Success:', result.billType);
+    console.log('Success! Bill type:', result.billType);
     return res.status(200).json(result);
 
   } catch (err) {
