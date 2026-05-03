@@ -13,7 +13,6 @@ export default async function handler(req, res) {
   }
 
   const { billType, text, imageBase64, imageMime } = req.body || {};
-
   if (!text && !imageBase64) {
     return res.status(400).json({ error: 'No bill text or image provided' });
   }
@@ -24,13 +23,15 @@ export default async function handler(req, res) {
     insurance: 'insurance', other: 'general'
   };
 
-  const prompt = `You are a billing expert. Analyze this ${typeMap[billType] || 'general'} bill and return ONLY valid JSON.
+  const prompt = `You are a billing expert. Analyze this ${typeMap[billType] || 'general'} bill and return ONLY valid JSON with no markdown or extra text.
 
-Return this exact structure (no markdown, no extra text):
-{"billType":"Hospital Bill","totalAmount":"$925","summary":"This is a hospital emergency visit bill with 4 charges.","overallVerdict":"warn","verdictText":"Two charges look unusual and are worth questioning.","potentialSavings":"$200","flags":[{"name":"Facility Fee","amount":"$200","type":"warn","badge":"Verify This","explanation":"This fee is often negotiable. Ask if it can be waived."}],"lineItems":[{"icon":"🏥","name":"Emergency Room Visit","amount":"$450","explanation":"The base charge for using the emergency room."}],"questionsToAsk":["Can you waive the facility fee?","Do you offer a payment plan?"]}
+Required JSON structure:
+{"billType":"descriptive name","totalAmount":"$X","summary":"2 sentences about what this bill is for","overallVerdict":"ok or warn or danger","verdictText":"one honest sentence about this bill","potentialSavings":"$X or null","flags":[{"name":"charge name","amount":"$X","type":"warn","badge":"Suspicious","explanation":"plain English explanation"}],"lineItems":[{"icon":"emoji","name":"charge name","amount":"$X","explanation":"plain English explanation"}],"questionsToAsk":["question 1","question 2"]}
 
-Bill to analyze:
-${text || 'See image provided'}`;
+Rules: flags = suspicious items only max 5, empty [] if normal. lineItems = ALL charges max 12. questionsToAsk = 3 to 5 questions. Return ONLY JSON.
+
+Bill:
+${text || 'Analyze the image provided.'}`;
 
   const parts = [];
   if (imageBase64) {
@@ -38,13 +39,12 @@ ${text || 'See image provided'}`;
   }
   parts.push({ text: prompt });
 
+  // Use only gemini-2.0-flash — confirmed working from API key test
   const model = 'gemini-2.0-flash';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   try {
-    console.log('Calling Gemini model:', model);
-    console.log('Has image:', !!imageBase64);
-    console.log('Has text:', !!text);
+    console.log('Calling:', model);
 
     const response = await fetch(url, {
       method: 'POST',
@@ -56,24 +56,22 @@ ${text || 'See image provided'}`;
     });
 
     const data = await response.json();
-    console.log('Gemini HTTP status:', response.status);
-    console.log('Gemini response keys:', Object.keys(data));
+    console.log('Status:', response.status);
 
-    if (!response.ok) {
-      console.error('Gemini error:', JSON.stringify(data));
-      return res.status(500).json({ 
-        error: data.error?.message || 'Gemini API error: ' + response.status,
-        details: data.error
-      });
+    if (response.status === 429) {
+      return res.status(429).json({ error: 'Rate limit reached. Please wait 30 seconds and try again.' });
     }
 
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    console.log('Raw text length:', rawText?.length);
-    console.log('Raw text preview:', rawText?.substring(0, 200));
+    if (!response.ok) {
+      console.error('Error:', JSON.stringify(data.error));
+      return res.status(500).json({ error: data.error?.message || 'Gemini error ' + response.status });
+    }
+
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    console.log('Response length:', rawText.length);
 
     if (!rawText) {
-      console.error('No text in response:', JSON.stringify(data));
-      return res.status(500).json({ error: 'Gemini returned empty response', raw: data });
+      return res.status(500).json({ error: 'Empty response from Gemini' });
     }
 
     const clean = rawText.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
@@ -81,17 +79,16 @@ ${text || 'See image provided'}`;
     const end = clean.lastIndexOf('}');
 
     if (start === -1 || end === -1) {
-      console.error('No JSON found in:', clean);
-      return res.status(500).json({ error: 'Could not find JSON in response', raw: clean });
+      console.error('No JSON found:', clean.substring(0, 300));
+      return res.status(500).json({ error: 'Could not parse AI response' });
     }
 
     const result = JSON.parse(clean.substring(start, end + 1));
-    console.log('Success! Bill type:', result.billType);
+    console.log('Success:', result.billType);
     return res.status(200).json(result);
 
   } catch (err) {
-    console.error('Caught error:', err.message);
-    console.error('Stack:', err.stack);
+    console.error('Error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 }
